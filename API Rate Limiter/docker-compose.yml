@@ -1,0 +1,164 @@
+# docker-compose.yml
+# ─────────────────────────────────────────────────────────────────────────────
+# Distributed Rate Limiter Stack
+#
+# Services:
+#   redis    — Centralized rate limit store (single instance, shared by all APIs)
+#   api1     — First Node.js API instance
+#   api2     — Second Node.js API instance
+#   nginx    — Load balancer (round-robin between api1 and api2)
+#
+# HOW CONTAINERS COMMUNICATE:
+#   Docker Compose creates a private virtual network ("rate-limiter-network").
+#   Each container is reachable by its service name as a DNS hostname.
+#   e.g., api1 can reach Redis at redis:6379
+#         Nginx can reach api1 at api1:3000 and api2 at api2:3000
+#   This is Docker's embedded DNS server — no IPs to hardcode.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: rate-limiter-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379" # Expose for local debugging (remove in prod)
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data # Persist rate limit data across restarts
+    networks:
+      - rate-limiter-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── API Instance 1 ─────────────────────────────────────────────────────────
+  api1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: rate-limiter-api1
+    restart: unless-stopped
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+      - REDIS_URL=redis://redis:6379
+      - RATE_LIMIT_WINDOW_MS=60000
+      - RATE_LIMIT_MAX_REQUESTS=10
+      - SLIDING_WINDOW_ENABLED=true
+      - TOKEN_BUCKET_CAPACITY=20
+      - TOKEN_BUCKET_REFILL_RATE=5
+      - API_KEY_LIMIT=100
+      - ADMIN_API_KEY=admin-secret-key-change-in-production
+      - LOG_LEVEL=info
+    depends_on:
+      redis:
+        condition: service_healthy # Don't start until Redis is healthy
+    networks:
+      - rate-limiter-network
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--quiet",
+          "--tries=1",
+          "--spider",
+          "http://localhost:3000/health",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ── API Instance 2 ─────────────────────────────────────────────────────────
+  # Identical to api1 — this is the second horizontally-scaled instance.
+  # Both api1 and api2 connect to the SAME Redis, so rate limits are shared.
+  api2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: rate-limiter-api2
+    restart: unless-stopped
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+      - REDIS_URL=redis://redis:6379
+      - RATE_LIMIT_WINDOW_MS=60000
+      - RATE_LIMIT_MAX_REQUESTS=10
+      - SLIDING_WINDOW_ENABLED=true
+      - TOKEN_BUCKET_CAPACITY=20
+      - TOKEN_BUCKET_REFILL_RATE=5
+      - API_KEY_LIMIT=100
+      - ADMIN_API_KEY=admin-secret-key-change-in-production
+      - LOG_LEVEL=info
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - rate-limiter-network
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--quiet",
+          "--tries=1",
+          "--spider",
+          "http://localhost:3000/health",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ── Nginx Load Balancer ────────────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: rate-limiter-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80" # Single public entry point
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api1
+      - api2
+    networks:
+      - rate-limiter-network
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--quiet",
+          "--tries=1",
+          "--spider",
+          "http://localhost/health",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+# ── Persistent volumes ─────────────────────────────────────────────────────
+volumes:
+  redis-data:
+    driver: local
+
+# ── Network ────────────────────────────────────────────────────────────────
+networks:
+  rate-limiter-network:
+    driver: bridge
+    # All containers on this network can resolve each other by service name
+    # e.g., "redis", "api1", "api2", "nginx" as DNS hostnames
